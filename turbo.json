@@ -1,0 +1,34 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalEnv": ["PORT", "VITE_WS_URL", "T3CODE_DESKTOP_WS_URL"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "build:tauri": {
+      "dependsOn": ["^build"],
+      "outputs": ["src-tauri/target/**"]
+    },
+    "dev": {
+      "dependsOn": ["@t3tools/contracts#build"],
+      "cache": false,
+      "persistent": true
+    },
+    "dev:tauri": {
+      "dependsOn": ["@t3tools/contracts#build"],
+      "cache": false,
+      "persistent": true
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"],
+      "outputs": [],
+      "cache": false
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "outputs": []
+    }
+  }
+}
