@@ -13,6 +13,7 @@ import { useThreadSelectionStore } from "../threadSelectionStore";
 import { Sidebar, SidebarProvider } from "~/components/ui/sidebar";
 import { resolveSidebarNewThreadEnvMode } from "~/components/Sidebar.logic";
 import { useAppSettings } from "~/appSettings";
+import { subscribeDesktopMenuActions } from "../desktopMenuActions";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
@@ -94,13 +95,7 @@ function ChatRouteLayout() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    const onMenuAction = window.desktopBridge?.onMenuAction;
-    if (typeof onMenuAction !== "function") {
-      return;
-    }
-
-    const unsubscribe = onMenuAction((action) => {
-      if (action !== "open-settings") return;
+    const unsubscribe = subscribeDesktopMenuActions(window.desktopBridge, () => {
       void navigate({ to: "/settings" });
     });
 

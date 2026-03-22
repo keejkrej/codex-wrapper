@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ContextMenuItem,
   DesktopBridge,
@@ -7,11 +8,11 @@ import type {
   DesktopUpdateState,
 } from "@t3tools/contracts";
 
-import { showContextMenuFallback } from "./contextMenuFallback";
-
-const noopUnsubscribe = () => {};
 type DesktopWindow = Window & { __TAURI_INTERNALS__?: unknown; desktopBridge?: DesktopBridge };
 const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
+const MENU_ACTION_EVENT = "desktop:menu-action";
+const UPDATE_STATE_EVENT = "desktop:update-state";
+const WINDOW_TARGET = "main";
 
 const isTauriRuntime =
   typeof window !== "undefined" &&
@@ -51,9 +52,28 @@ export async function installTauriDesktopBridge(): Promise<void> {
     showContextMenu: <T extends string>(
       items: readonly ContextMenuItem<T>[],
       position?: { x: number; y: number },
-    ) => showContextMenuFallback(items, position),
+    ) => invoke<T | null>("show_context_menu", { items, position }),
     openExternal: (url: string) => invoke<boolean>("open_external", { url }),
-    onMenuAction: () => noopUnsubscribe,
+    onMenuAction: (listener) => {
+      let disposed = false;
+      let unlisten: UnlistenFn | null = null;
+      void listen<string>(MENU_ACTION_EVENT, (event) => {
+        if (typeof event.payload !== "string") return;
+        listener(event.payload);
+      }, { target: WINDOW_TARGET })
+        .then((unsubscribe) => {
+          if (disposed) {
+            unsubscribe();
+            return;
+          }
+          unlisten = unsubscribe;
+        })
+        .catch(() => undefined);
+      return () => {
+        disposed = true;
+        unlisten?.();
+      };
+    },
     getUpdateState: () =>
       invoke<DesktopUpdateState>("get_update_state").catch(() => createDisabledUpdateState()),
     downloadUpdate: () =>
@@ -68,6 +88,25 @@ export async function installTauriDesktopBridge(): Promise<void> {
         completed: false,
         state: createDisabledUpdateState(),
       })),
-    onUpdateState: () => noopUnsubscribe,
+    onUpdateState: (listener) => {
+      let disposed = false;
+      let unlisten: UnlistenFn | null = null;
+      void listen<DesktopUpdateState>(UPDATE_STATE_EVENT, (event) => {
+        if (typeof event.payload !== "object" || event.payload === null) return;
+        listener(event.payload);
+      }, { target: WINDOW_TARGET })
+        .then((unsubscribe) => {
+          if (disposed) {
+            unsubscribe();
+            return;
+          }
+          unlisten = unsubscribe;
+        })
+        .catch(() => undefined);
+      return () => {
+        disposed = true;
+        unlisten?.();
+      };
+    },
   } satisfies DesktopBridge;
 }
