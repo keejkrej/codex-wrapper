@@ -2,6 +2,7 @@
 
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use server::{start_server, ServerConfig, ServerHandle};
+use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State, Theme};
 
 struct DesktopState {
@@ -54,6 +55,47 @@ fn open_external(url: String) -> bool {
     webbrowser::open(&url).is_ok()
 }
 
+fn disabled_update_state() -> Value {
+    json!({
+        "enabled": false,
+        "status": "disabled",
+        "currentVersion": env!("CARGO_PKG_VERSION"),
+        "hostArch": "other",
+        "appArch": "other",
+        "runningUnderArm64Translation": false,
+        "availableVersion": Value::Null,
+        "downloadedVersion": Value::Null,
+        "downloadPercent": Value::Null,
+        "checkedAt": Value::Null,
+        "message": "Desktop update support has not been ported to the Tauri shell yet.",
+        "errorContext": Value::Null,
+        "canRetry": false,
+    })
+}
+
+#[tauri::command]
+fn get_update_state() -> Value {
+    disabled_update_state()
+}
+
+#[tauri::command]
+fn download_update() -> Value {
+    json!({
+        "accepted": false,
+        "completed": false,
+        "state": disabled_update_state(),
+    })
+}
+
+#[tauri::command]
+fn install_update() -> Value {
+    json!({
+        "accepted": false,
+        "completed": false,
+        "state": disabled_update_state(),
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -72,7 +114,10 @@ fn main() {
             pick_folder,
             confirm_dialog,
             set_theme,
-            open_external
+            open_external,
+            get_update_state,
+            download_update,
+            install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

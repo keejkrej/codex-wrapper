@@ -15,6 +15,11 @@ pub(crate) async fn handle_dispatch_command(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Command type is required"))?;
+    if let Some(command_id) = command.get("commandId").and_then(Value::as_str) {
+        if let Some(sequence) = state.find_command_receipt(command_id).await? {
+            return Ok(json!({ "sequence": sequence }));
+        }
+    }
 
     let snapshot = state.snapshot.lock().await.clone();
     let decided_events = decider::decide(&snapshot, &state.config, command).await?;

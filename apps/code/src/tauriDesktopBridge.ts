@@ -43,13 +43,6 @@ export async function installTauriDesktopBridge(): Promise<void> {
   }
 
   cachedWsUrl = await invoke<string | null>("get_ws_url").catch(() => null);
-  const disabledUpdateState = createDisabledUpdateState();
-  const buildDisabledUpdateAction = async (): Promise<DesktopUpdateActionResult> => ({
-    accepted: false,
-    completed: false,
-    state: disabledUpdateState,
-  });
-
   (window as DesktopWindow).desktopBridge = {
     getWsUrl: () => cachedWsUrl || env.VITE_WS_URL || null,
     pickFolder: () => invoke<string | null>("pick_folder"),
@@ -61,9 +54,20 @@ export async function installTauriDesktopBridge(): Promise<void> {
     ) => showContextMenuFallback(items, position),
     openExternal: (url: string) => invoke<boolean>("open_external", { url }),
     onMenuAction: () => noopUnsubscribe,
-    getUpdateState: async () => disabledUpdateState,
-    downloadUpdate: buildDisabledUpdateAction,
-    installUpdate: buildDisabledUpdateAction,
+    getUpdateState: () =>
+      invoke<DesktopUpdateState>("get_update_state").catch(() => createDisabledUpdateState()),
+    downloadUpdate: () =>
+      invoke<DesktopUpdateActionResult>("download_update").catch(async () => ({
+        accepted: false,
+        completed: false,
+        state: createDisabledUpdateState(),
+      })),
+    installUpdate: () =>
+      invoke<DesktopUpdateActionResult>("install_update").catch(async () => ({
+        accepted: false,
+        completed: false,
+        state: createDisabledUpdateState(),
+      })),
     onUpdateState: () => noopUnsubscribe,
   } satisfies DesktopBridge;
 }

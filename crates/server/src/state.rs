@@ -11,6 +11,7 @@ use crate::config::ServerConfig;
 use crate::decider::{self, DecidedEvent};
 use crate::keybindings::{keybindings_config_path, load_resolved_keybindings};
 use crate::model::{ReadModelState, TerminalSession};
+use crate::persistence::{Persistence, ProviderSessionBinding};
 use crate::projector;
 use crate::provider_health::provider_statuses;
 use crate::provider_runtime::ProviderRuntimeService;
@@ -25,6 +26,7 @@ pub(crate) struct AppState {
     pub config: ServerConfig,
     pub snapshot: Arc<Mutex<ReadModelState>>,
     pub events: Arc<Mutex<Vec<Value>>>,
+    pub persistence: Persistence,
     pub sequence: Arc<AtomicU64>,
     pub pushes: broadcast::Sender<Value>,
     pub terminals: Arc<Mutex<HashMap<String, TerminalSession>>>,
@@ -32,29 +34,47 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(config: ServerConfig) -> Self {
-        Self::new_with_provider_runtime(config, ProviderRuntimeService::new())
+    pub(crate) async fn new(config: ServerConfig) -> Result<Self> {
+        Self::new_with_provider_runtime(config, ProviderRuntimeService::new()).await
     }
 
-    pub(crate) fn new_with_provider_runtime(
+    pub(crate) async fn new_with_provider_runtime(
         config: ServerConfig,
         provider_runtime: ProviderRuntimeService,
-    ) -> Self {
+    ) -> Result<Self> {
         let (pushes, _) = broadcast::channel(256);
-        Self {
+        let persistence = Persistence::new(&config.state_dir)?;
+        let persisted_events = persistence.load_events().await?;
+        let mut snapshot = ReadModelState {
+            snapshot_sequence: 0,
+            projects: Vec::new(),
+            threads: Vec::new(),
+            updated_at: now_iso(),
+        };
+        let mut max_sequence = 0_u64;
+        for event in &persisted_events {
+            max_sequence = max_sequence.max(event["sequence"].as_u64().unwrap_or_default());
+            projector::apply(&mut snapshot, event);
+        }
+
+        let state = Self {
             config,
-            snapshot: Arc::new(Mutex::new(ReadModelState {
-                snapshot_sequence: 0,
-                projects: Vec::new(),
-                threads: Vec::new(),
-                updated_at: now_iso(),
-            })),
-            events: Arc::new(Mutex::new(Vec::new())),
-            sequence: Arc::new(AtomicU64::new(0)),
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            events: Arc::new(Mutex::new(persisted_events)),
+            persistence,
+            sequence: Arc::new(AtomicU64::new(max_sequence)),
             pushes,
             terminals: Arc::new(Mutex::new(HashMap::new())),
             provider_runtime,
-        }
+        };
+
+        let persisted_bindings = state.persistence.load_provider_session_bindings().await?;
+        state
+            .provider_runtime
+            .restore_persisted_bindings(persisted_bindings)
+            .await;
+
+        Ok(state)
     }
 
     pub(crate) fn cwd_string(&self) -> String {
@@ -103,22 +123,17 @@ impl AppState {
         &self,
         decided_events: Vec<DecidedEvent>,
     ) -> Result<Vec<Value>> {
-        let mut appended = Vec::with_capacity(decided_events.len());
-        for decided_event in decided_events {
-            let sequence = self.next_sequence();
-            let event = json!({
-                "sequence": sequence,
-                "eventId": Uuid::new_v4().to_string(),
-                "aggregateKind": decided_event.aggregate_kind,
-                "aggregateId": decided_event.aggregate_id,
-                "occurredAt": decided_event.occurred_at,
-                "commandId": decided_event.command_id,
-                "causationEventId": decided_event.causation_event_id,
-                "correlationId": decided_event.correlation_id,
-                "metadata": decided_event.metadata,
-                "type": decided_event.event_type,
-                "payload": decided_event.payload,
-            });
+        let appended = self
+            .persistence
+            .append_events(&decided_events, || Uuid::new_v4().to_string())
+            .await?;
+        if let Some(last_event) = appended.last() {
+            self.sequence.store(
+                last_event["sequence"].as_u64().unwrap_or_default(),
+                Ordering::SeqCst,
+            );
+        }
+        for event in &appended {
             self.events.lock().await.push(event.clone());
             {
                 let mut snapshot = self.snapshot.lock().await;
@@ -126,9 +141,25 @@ impl AppState {
             }
             self.emit_push(WS_CHANNEL_ORCHESTRATION_DOMAIN_EVENT, event.clone())
                 .await?;
-            appended.push(event);
         }
         Ok(appended)
+    }
+
+    pub(crate) async fn find_command_receipt(&self, command_id: &str) -> Result<Option<u64>> {
+        self.persistence.find_command_receipt(command_id).await
+    }
+
+    pub(crate) async fn upsert_provider_session_binding(
+        &self,
+        binding: ProviderSessionBinding,
+    ) -> Result<()> {
+        self.persistence
+            .upsert_provider_session_binding(&binding)
+            .await
+    }
+
+    pub(crate) async fn delete_provider_session_binding(&self, thread_id: &str) -> Result<()> {
+        self.persistence.delete_provider_session_binding(thread_id).await
     }
 
     pub(crate) async fn provider_statuses(&self) -> Value {

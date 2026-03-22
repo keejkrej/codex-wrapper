@@ -9,6 +9,7 @@ mod keybindings;
 mod model;
 mod open;
 mod orchestration;
+mod persistence;
 mod projector;
 mod provider_adapter;
 mod provider_command_reactor;
@@ -31,6 +32,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::{sleep, Duration};
@@ -176,12 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_boots_with_empty_snapshot() {
-        let server = start_server(ServerConfig::desktop(
-            "Test",
-            std::env::current_dir().unwrap(),
-        ))
-        .await
-        .unwrap();
+        let server = start_server(test_config("Test")).await.unwrap();
         assert!(server.ws_url().starts_with("ws://127.0.0.1:"));
         server.shutdown().await;
     }
@@ -197,6 +194,30 @@ mod tests {
             Arc::new(FakeAdapter::new("codex")) as Arc<dyn provider_adapter::ProviderAdapter>,
             Arc::new(FakeAdapter::new("claudeAgent")) as Arc<dyn provider_adapter::ProviderAdapter>,
         ])
+    }
+
+    fn test_config(app_name: &str) -> ServerConfig {
+        let root = std::env::temp_dir()
+            .join("codex-wrapper-server-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        let cwd = root.join("workspace");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        ServerConfig {
+            app_name: app_name.to_string(),
+            mode: config::RuntimeMode::Desktop,
+            cwd: PathBuf::from(&cwd),
+            state_dir,
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            auth_token: None,
+            dev_url: None,
+            static_dir: None,
+            no_browser: true,
+            auto_bootstrap_project_from_cwd: false,
+            log_websocket_events: false,
+        }
     }
 
     async fn seed_project_and_thread(state: Arc<state::AppState>) {
@@ -238,9 +259,11 @@ mod tests {
     #[tokio::test]
     async fn thread_turn_start_runs_through_runtime_pipeline() {
         let state = Arc::new(state::AppState::new_with_provider_runtime(
-            ServerConfig::desktop("Test", std::env::current_dir().unwrap()),
+            test_config("Test"),
             test_runtime_service(),
-        ));
+        )
+        .await
+        .unwrap());
         seed_project_and_thread(state.clone()).await;
 
         orchestration::handle_dispatch_command(
@@ -301,9 +324,11 @@ mod tests {
     #[tokio::test]
     async fn approval_response_unblocks_waiting_turn() {
         let state = Arc::new(state::AppState::new_with_provider_runtime(
-            ServerConfig::desktop("Test", std::env::current_dir().unwrap()),
+            test_config("Test"),
             test_runtime_service(),
-        ));
+        )
+        .await
+        .unwrap());
         seed_project_and_thread(state.clone()).await;
 
         orchestration::handle_dispatch_command(
@@ -397,5 +422,62 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.role == "assistant" && !message.text.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn persisted_events_reload_and_command_receipts_are_idempotent() {
+        let config = test_config("Persistence");
+        let state = Arc::new(
+            state::AppState::new_with_provider_runtime(config.clone(), test_runtime_service())
+                .await
+                .unwrap(),
+        );
+        seed_project_and_thread(state.clone()).await;
+
+        let first_response = orchestration::handle_dispatch_command(
+            state.clone(),
+            &json!({
+                "type": "thread.meta.update",
+                "commandId": "cmd-meta-update",
+                "threadId": "thread-1",
+                "title": "Renamed thread",
+            }),
+        )
+        .await
+        .unwrap();
+        let first_sequence = first_response["sequence"].as_u64().unwrap_or_default();
+        let first_event_count = state.events.lock().await.len();
+        drop(state);
+
+        let reloaded = Arc::new(
+            state::AppState::new_with_provider_runtime(config, test_runtime_service())
+                .await
+                .unwrap(),
+        );
+        let snapshot = reloaded.snapshot.lock().await.clone();
+        let thread = snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-1")
+            .unwrap();
+        assert_eq!(thread.title, "Renamed thread");
+        assert_eq!(reloaded.events.lock().await.len(), first_event_count);
+
+        let repeated_response = orchestration::handle_dispatch_command(
+            reloaded.clone(),
+            &json!({
+                "type": "thread.meta.update",
+                "commandId": "cmd-meta-update",
+                "threadId": "thread-1",
+                "title": "Renamed thread again",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repeated_response["sequence"].as_u64().unwrap_or_default(),
+            first_sequence
+        );
+        assert_eq!(reloaded.events.lock().await.len(), first_event_count);
     }
 }

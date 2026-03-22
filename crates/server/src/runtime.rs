@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
-use crate::config::ServerConfig;
+use crate::config::{RuntimeMode, ServerConfig};
+use crate::orchestration;
 use crate::state::AppState;
+use crate::util::now_iso;
 use crate::ws_server::router;
 
 #[derive(Clone)]
@@ -42,8 +46,14 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle> {
     let cwd = config.cwd.canonicalize().unwrap_or(config.cwd.clone());
     let mut config = config;
     config.cwd = cwd;
+    if config.mode == RuntimeMode::Desktop && config.auth_token.is_none() {
+        config.auth_token = Some(Uuid::new_v4().to_string());
+    }
 
-    let state = Arc::new(AppState::new(config.clone()));
+    let state = Arc::new(AppState::new(config.clone()).await?);
+    if config.auto_bootstrap_project_from_cwd {
+        auto_bootstrap_project_from_cwd(state.clone()).await?;
+    }
     let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     let local_addr = listener.local_addr()?;
     let host = if local_addr.ip().is_loopback() {
@@ -54,7 +64,10 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle> {
         local_addr.ip().to_string()
     };
     let http_url = format!("http://{}:{}", host, local_addr.port());
-    let ws_url = format!("ws://{}:{}/ws", host, local_addr.port());
+    let ws_url = match config.auth_token.as_deref() {
+        Some(token) => format!("ws://{}:{}/ws?token={}", host, local_addr.port(), token),
+        None => format!("ws://{}:{}/ws", host, local_addr.port()),
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let app = router(state.clone());
     let server_task = tokio::spawn(async move {
@@ -73,4 +86,71 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle> {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         }),
     })
+}
+
+async fn auto_bootstrap_project_from_cwd(state: Arc<AppState>) -> Result<()> {
+    let cwd = state.cwd_string();
+    let snapshot = state.snapshot.lock().await.clone();
+    let existing_project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.workspace_root == cwd && project.deleted_at.is_none())
+        .cloned();
+    let project_id = existing_project
+        .as_ref()
+        .map(|project| project.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let default_model = existing_project
+        .as_ref()
+        .and_then(|project| project.default_model.clone())
+        .unwrap_or_else(|| "gpt-5-codex".to_string());
+
+    if existing_project.is_none() {
+        orchestration::handle_dispatch_command(
+            state.clone(),
+            &json!({
+                "type": "project.create",
+                "commandId": Uuid::new_v4().to_string(),
+                "projectId": project_id,
+                "title": state
+                    .config
+                    .cwd
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "project".to_string()),
+                "workspaceRoot": cwd,
+                "defaultModel": default_model,
+                "createdAt": now_iso(),
+            }),
+        )
+        .await?;
+    }
+
+    let snapshot = state.snapshot.lock().await.clone();
+    let has_thread = snapshot
+        .threads
+        .iter()
+        .any(|thread| thread.project_id == project_id && thread.deleted_at.is_none());
+    if !has_thread {
+        orchestration::handle_dispatch_command(
+            state,
+            &json!({
+                "type": "thread.create",
+                "commandId": Uuid::new_v4().to_string(),
+                "threadId": Uuid::new_v4().to_string(),
+                "projectId": project_id,
+                "title": "New thread",
+                "model": default_model,
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "createdAt": now_iso(),
+            }),
+        )
+        .await?;
+    }
+
+    Ok(())
 }

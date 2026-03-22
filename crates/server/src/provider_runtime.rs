@@ -9,6 +9,7 @@ use crate::claude_adapter::ClaudeCliAdapter;
 use crate::codex_adapter::CodexCliAdapter;
 use crate::diff::summarize_thread_changes;
 use crate::model::ChatAttachment;
+use crate::persistence::ProviderSessionBinding;
 use crate::provider_adapter::{
     AdapterEvent, ProviderAdapter, ProviderAdapterRegistry, ProviderSessionState, SendTurnInput,
     StartSessionInput,
@@ -64,6 +65,21 @@ impl ProviderRuntimeService {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             adapters: Arc::new(ProviderAdapterRegistry::new(adapters)),
+        }
+    }
+
+    pub(crate) async fn restore_persisted_bindings(&self, bindings: Vec<ProviderSessionBinding>) {
+        let mut sessions = self.sessions.lock().await;
+        for binding in bindings {
+            sessions.insert(
+                binding.thread_id,
+                RuntimeSession {
+                    provider_name: binding.provider_name,
+                    runtime_mode: binding.runtime_mode,
+                    provider_session_id: binding.provider_session_id,
+                    current_turn: None,
+                },
+            );
         }
     }
 
@@ -143,6 +159,14 @@ impl ProviderRuntimeService {
                 session.provider_session_id = session_state.provider_session_id.clone();
             }
         }
+        self.persist_binding(
+            &state,
+            &input.thread_id,
+            "starting",
+            Some(turn_id.clone()),
+            None,
+        )
+        .await;
 
         ingest(
             &state,
@@ -204,7 +228,7 @@ impl ProviderRuntimeService {
                 match event {
                     AdapterEvent::SessionId(session_id) => {
                         service_for_events
-                            .update_provider_session_id(&thread_id, Some(session_id))
+                            .update_provider_session_id(&state, &thread_id, Some(session_id))
                             .await;
                     }
                     AdapterEvent::Runtime(runtime_event) => {
@@ -217,6 +241,7 @@ impl ProviderRuntimeService {
                 Ok(Ok(updated_session)) => {
                     service
                         .update_provider_session_id(
+                            &state_for_send,
                             &thread_id,
                             updated_session.provider_session_id.clone(),
                         )
@@ -262,6 +287,9 @@ impl ProviderRuntimeService {
                         },
                     )
                     .await;
+                    service
+                        .persist_binding(&state_for_send, &thread_id, "ready", None, None)
+                        .await;
                 }
                 Ok(Err(error)) => {
                     service
@@ -356,6 +384,9 @@ impl ProviderRuntimeService {
                     },
                 )
                 .await;
+                self
+                    .persist_binding(&state, thread_id, "interrupted", None, None)
+                    .await;
             }
         }
     }
@@ -382,6 +413,7 @@ impl ProviderRuntimeService {
         let provider_name = session.provider_name.clone();
         let runtime_mode = session.runtime_mode.clone();
         drop(sessions);
+        let _ = state.delete_provider_session_binding(thread_id).await;
         ingest(
             &state,
             RuntimeEvent::SessionSet {
@@ -487,11 +519,19 @@ impl ProviderRuntimeService {
         }
     }
 
-    async fn update_provider_session_id(&self, thread_id: &str, session_id: Option<String>) {
+    async fn update_provider_session_id(
+        &self,
+        state: &AppState,
+        thread_id: &str,
+        session_id: Option<String>,
+    ) {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(thread_id) {
             session.provider_session_id = session_id;
         }
+        drop(sessions);
+        self.persist_binding(state, thread_id, "running", self.active_turn_id(thread_id).await, None)
+            .await;
     }
 
     async fn finish_turn(&self, thread_id: &str) {
@@ -541,11 +581,52 @@ impl ProviderRuntimeService {
                 provider_name: provider_name.to_string(),
                 runtime_mode: runtime_mode.to_string(),
                 active_turn_id: None,
-                last_error: Some(detail),
+                last_error: Some(detail.clone()),
                 updated_at: now_iso(),
             },
         )
         .await;
+        self.persist_binding(
+            &state,
+            thread_id,
+            "error",
+            None,
+            Some(detail.clone()),
+        )
+        .await;
         self.finish_turn(thread_id).await;
+    }
+
+    async fn active_turn_id(&self, thread_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(thread_id)
+            .and_then(|session| session.current_turn.as_ref().map(|turn| turn.turn_id.clone()))
+    }
+
+    async fn persist_binding(
+        &self,
+        state: &AppState,
+        thread_id: &str,
+        status: &str,
+        active_turn_id: Option<String>,
+        last_error: Option<String>,
+    ) {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(thread_id) else {
+            return;
+        };
+        let _ = state
+            .upsert_provider_session_binding(ProviderSessionBinding {
+                thread_id: thread_id.to_string(),
+                provider_name: session.provider_name.clone(),
+                runtime_mode: session.runtime_mode.clone(),
+                provider_session_id: session.provider_session_id.clone(),
+                status: status.to_string(),
+                active_turn_id,
+                last_error,
+                updated_at: now_iso(),
+            })
+            .await;
     }
 }

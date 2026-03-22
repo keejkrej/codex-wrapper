@@ -24,8 +24,15 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   getDefaultModel,
+  getDefaultReasoningEffort,
+  getReasoningEffortOptions,
+  isClaudeUltrathinkPrompt,
+  normalizeClaudeModelOptions,
+  normalizeCodexModelOptions,
   normalizeModelSlug,
+  resolveReasoningEffortForProvider,
   resolveModelSlugForProvider,
+  supportsClaudeUltrathinkKeyword,
 } from "@t3tools/shared/model";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -119,12 +126,7 @@ import {
 import { SidebarTrigger } from "./ui/sidebar";
 import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
-import {
-  getCustomModelOptionsByProvider,
-  getCustomModelsByProvider,
-  resolveAppModelSelection,
-  useAppSettings,
-} from "../appSettings";
+import { resolveAppModelSelection, useAppSettings } from "../appSettings";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
   type ComposerImageAttachment,
@@ -151,15 +153,12 @@ import { buildExpandedImagePreview, ExpandedImagePreview } from "./chat/Expanded
 import { AVAILABLE_PROVIDER_OPTIONS, ProviderModelPicker } from "./chat/ProviderModelPicker";
 import { ComposerCommandItem, ComposerCommandMenu } from "./chat/ComposerCommandMenu";
 import { ComposerPendingApprovalActions } from "./chat/ComposerPendingApprovalActions";
+import { ClaudeTraitsMenuContent, ClaudeTraitsPicker } from "./chat/ClaudeTraitsPicker";
+import { CodexTraitsMenuContent, CodexTraitsPicker } from "./chat/CodexTraitsPicker";
 import { CompactComposerControlsMenu } from "./chat/CompactComposerControlsMenu";
 import { ComposerPendingApprovalPanel } from "./chat/ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./chat/ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./chat/ComposerPlanFollowUpBanner";
-import {
-  getComposerProviderState,
-  renderProviderTraitsMenuContent,
-  renderProviderTraitsPicker,
-} from "./chat/composerProviderRegistry";
 import { ProviderHealthBanner } from "./chat/ProviderHealthBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import {
@@ -169,6 +168,7 @@ import {
   cloneComposerImageForRetry,
   collectUserMessageBlobPreviewUrls,
   deriveComposerSendState,
+  getCustomModelOptionsByProvider,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
   LastInvokedScriptByProjectSchema,
   PullRequestDialogState,
@@ -244,7 +244,6 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const setStoreThreadError = useStore((store) => store.setError);
   const setStoreThreadBranch = useStore((store) => store.setThreadBranch);
   const { settings } = useAppSettings();
-  const setStickyComposerModel = useComposerDraftStore((store) => store.setStickyModel);
   const timestampFormat = settings.timestampFormat;
   const navigate = useNavigate();
   const rawSearch = useSearch({
@@ -597,27 +596,72 @@ export default function ChatView({ threadId }: ChatViewProps) {
     selectedProvider,
     activeThread?.model ?? activeProject?.model ?? getDefaultModel(selectedProvider),
   );
-  const customModelsByProvider = useMemo(() => getCustomModelsByProvider(settings), [settings]);
+  const customModelsByProvider = useMemo(
+    () => ({
+      codex: settings.customCodexModels,
+      claudeAgent: settings.customClaudeModels,
+    }),
+    [settings.customClaudeModels, settings.customCodexModels],
+  );
+  const customModelsForSelectedProvider = customModelsByProvider[selectedProvider];
   const selectedModel = useMemo(() => {
     const draftModel = composerDraft.model;
     if (!draftModel) {
       return baseThreadModel;
     }
-    return resolveAppModelSelection(selectedProvider, customModelsByProvider, draftModel);
-  }, [baseThreadModel, composerDraft.model, customModelsByProvider, selectedProvider]);
+    return resolveAppModelSelection(
+      selectedProvider,
+      customModelsForSelectedProvider,
+      draftModel,
+    ) as ModelSlug;
+  }, [baseThreadModel, composerDraft.model, customModelsForSelectedProvider, selectedProvider]);
   const draftModelOptions = composerDraft.modelOptions;
-  const composerProviderState = useMemo(
-    () =>
-      getComposerProviderState({
-        provider: selectedProvider,
-        model: selectedModel,
-        prompt,
-        modelOptions: draftModelOptions,
-      }),
-    [draftModelOptions, prompt, selectedModel, selectedProvider],
-  );
-  const selectedPromptEffort = composerProviderState.promptEffort;
-  const selectedModelOptionsForDispatch = composerProviderState.modelOptionsForDispatch;
+  const selectedCodexEffort =
+    selectedProvider === "codex"
+      ? (resolveReasoningEffortForProvider("codex", draftModelOptions?.codex?.reasoningEffort) ??
+        getDefaultReasoningEffort("codex"))
+      : null;
+  const selectedClaudeReasoningOptions =
+    selectedProvider === "claudeAgent"
+      ? getReasoningEffortOptions("claudeAgent", selectedModel)
+      : ([] as const);
+  const selectedClaudeBaseEffort =
+    selectedProvider === "claudeAgent" && selectedClaudeReasoningOptions.length > 0
+      ? (() => {
+          const draftEffort = resolveReasoningEffortForProvider(
+            "claudeAgent",
+            draftModelOptions?.claudeAgent?.effort,
+          );
+          if (
+            draftEffort &&
+            draftEffort !== "ultrathink" &&
+            selectedClaudeReasoningOptions.includes(draftEffort)
+          ) {
+            return draftEffort;
+          }
+          const defaultEffort = getDefaultReasoningEffort("claudeAgent");
+          return selectedClaudeReasoningOptions.includes(defaultEffort) ? defaultEffort : null;
+        })()
+      : null;
+  const isClaudeUltrathink =
+    selectedProvider === "claudeAgent" &&
+    supportsClaudeUltrathinkKeyword(selectedModel) &&
+    isClaudeUltrathinkPrompt(prompt);
+  const selectedPromptEffort = selectedCodexEffort ?? selectedClaudeBaseEffort;
+  const selectedModelOptionsForDispatch = useMemo(() => {
+    if (selectedProvider === "codex") {
+      const codexOptions = normalizeCodexModelOptions(draftModelOptions?.codex);
+      return codexOptions ? { codex: codexOptions } : undefined;
+    }
+    if (selectedProvider === "claudeAgent") {
+      const claudeOptions = normalizeClaudeModelOptions(
+        selectedModel,
+        draftModelOptions?.claudeAgent,
+      );
+      return claudeOptions ? { claudeAgent: claudeOptions } : undefined;
+    }
+    return undefined;
+  }, [draftModelOptions, selectedModel, selectedProvider]);
   const providerOptionsForDispatch = useMemo(() => {
     if (!settings.codexBinaryPath && !settings.codexHomePath) {
       return undefined;
@@ -1105,9 +1149,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const keybindings = serverConfigQuery.data?.keybindings ?? EMPTY_KEYBINDINGS;
   const availableEditors = serverConfigQuery.data?.availableEditors ?? EMPTY_AVAILABLE_EDITORS;
   const providerStatuses = serverConfigQuery.data?.providers ?? EMPTY_PROVIDER_STATUSES;
+  const activeProvider = activeThread?.session?.provider ?? "codex";
   const activeProviderStatus = useMemo(
-    () => providerStatuses.find((status) => status.provider === selectedProvider) ?? null,
-    [selectedProvider, providerStatuses],
+    () => providerStatuses.find((status) => status.provider === activeProvider) ?? null,
+    [activeProvider, providerStatuses],
   );
   const activeProjectCwd = activeProject?.cwd ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
@@ -3096,20 +3141,20 @@ export default function ChatView({ threadId }: ChatViewProps) {
         scheduleComposerFocus();
         return;
       }
-      const resolvedModel = resolveAppModelSelection(provider, customModelsByProvider, model);
       setComposerDraftProvider(activeThread.id, provider);
-      setComposerDraftModel(activeThread.id, resolvedModel);
-      setStickyComposerModel(resolvedModel);
+      setComposerDraftModel(
+        activeThread.id,
+        resolveAppModelSelection(provider, customModelsByProvider[provider], model),
+      );
       scheduleComposerFocus();
     },
     [
       activeThread,
+      customModelsByProvider,
       lockedProvider,
       scheduleComposerFocus,
       setComposerDraftModel,
       setComposerDraftProvider,
-      setStickyComposerModel,
-      customModelsByProvider,
     ],
   );
   const setPromptFromTraits = useCallback(
@@ -3128,18 +3173,6 @@ export default function ChatView({ threadId }: ChatViewProps) {
     },
     [scheduleComposerFocus, setPrompt],
   );
-  const providerTraitsMenuContent = renderProviderTraitsMenuContent({
-    provider: selectedProvider,
-    threadId,
-    model: selectedModel,
-    onPromptChange: setPromptFromTraits,
-  });
-  const providerTraitsPicker = renderProviderTraitsPicker({
-    provider: selectedProvider,
-    threadId,
-    model: selectedModel,
-    onPromptChange: setPromptFromTraits,
-  });
   const onEnvModeChange = useCallback(
     (mode: DraftThreadEnvMode) => {
       if (isLocalDraftThread) {
@@ -3553,7 +3586,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                 <button
                   type="button"
                   onClick={() => scrollMessagesToBottom("smooth")}
-                  className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:border-border hover:text-foreground hover:cursor-pointer"
+                  className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground"
                 >
                   <ChevronDownIcon className="size-3.5" />
                   Scroll to bottom
@@ -3573,7 +3606,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
               <div
                 className={cn(
                   "group rounded-[22px] p-px transition-colors duration-200",
-                  composerProviderState.composerFrameClassName,
+                  isClaudeUltrathink ? "ultrathink-frame" : undefined,
                 )}
                 onDragEnter={onComposerDragEnter}
                 onDragOver={onComposerDragOver}
@@ -3584,7 +3617,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                   className={cn(
                     "rounded-[20px] border bg-card transition-colors duration-200 focus-within:border-ring/45",
                     isDragOverComposer ? "border-primary/70 bg-accent/30" : "border-border",
-                    composerProviderState.composerSurfaceClassName,
+                    isClaudeUltrathink ? "shadow-[0_0_0_1px_rgba(255,255,255,0.04)_inset]" : "",
                   )}
                 >
                   {activePendingApproval ? (
@@ -3773,12 +3806,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                           model={selectedModelForPickerWithCustomFallback}
                           lockedProvider={lockedProvider}
                           modelOptionsByProvider={modelOptionsByProvider}
-                          {...(composerProviderState.modelPickerIconClassName
-                            ? {
-                                activeProviderIconClassName:
-                                  composerProviderState.modelPickerIconClassName,
-                              }
-                            : {})}
+                          ultrathinkActive={isClaudeUltrathink}
                           onProviderModelChange={onProviderModelSelect}
                         />
 
@@ -3790,20 +3818,42 @@ export default function ChatView({ threadId }: ChatViewProps) {
                             interactionMode={interactionMode}
                             planSidebarOpen={planSidebarOpen}
                             runtimeMode={runtimeMode}
-                            traitsMenuContent={providerTraitsMenuContent}
+                            traitsMenuContent={
+                              selectedProvider === "codex" ? (
+                                <CodexTraitsMenuContent threadId={threadId} />
+                              ) : selectedProvider === "claudeAgent" ? (
+                                <ClaudeTraitsMenuContent
+                                  threadId={threadId}
+                                  model={selectedModel}
+                                  onPromptChange={setPromptFromTraits}
+                                />
+                              ) : null
+                            }
                             onToggleInteractionMode={toggleInteractionMode}
                             onTogglePlanSidebar={togglePlanSidebar}
                             onToggleRuntimeMode={toggleRuntimeMode}
                           />
                         ) : (
                           <>
-                            {providerTraitsPicker ? (
+                            {selectedProvider === "codex" ? (
                               <>
                                 <Separator
                                   orientation="vertical"
                                   className="mx-0.5 hidden h-4 sm:block"
                                 />
-                                {providerTraitsPicker}
+                                <CodexTraitsPicker threadId={threadId} />
+                              </>
+                            ) : selectedProvider === "claudeAgent" ? (
+                              <>
+                                <Separator
+                                  orientation="vertical"
+                                  className="mx-0.5 hidden h-4 sm:block"
+                                />
+                                <ClaudeTraitsPicker
+                                  threadId={threadId}
+                                  model={selectedModel}
+                                  onPromptChange={setPromptFromTraits}
+                                />
                               </>
                             ) : null}
 
