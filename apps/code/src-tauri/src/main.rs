@@ -1,7 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use tauri::{AppHandle, Manager, Theme};
+use server::{start_server, ServerConfig, ServerHandle};
+use tauri::{AppHandle, Manager, State, Theme};
+
+struct DesktopState {
+    server: ServerHandle,
+}
+
+#[tauri::command]
+fn get_ws_url(state: State<'_, DesktopState>) -> String {
+    state.server.ws_url()
+}
 
 #[tauri::command]
 fn pick_folder() -> Option<String> {
@@ -47,12 +57,18 @@ fn open_external(url: String) -> bool {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            let server = tauri::async_runtime::block_on(start_server(ServerConfig::desktop(
+                "T3 Code",
+                std::env::current_dir().unwrap_or_default(),
+            )))?;
+            app.manage(DesktopState { server });
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title("T3 Code (Alpha)");
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_ws_url,
             pick_folder,
             confirm_dialog,
             set_theme,

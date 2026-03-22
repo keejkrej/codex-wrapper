@@ -3705,7 +3705,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "t3code-tauri-shell"
+name = "app-code"
 version = "0.0.13"
 dependencies = [
  "rfd",

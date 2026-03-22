@@ -1,0 +1,3 @@
+[workspace]
+members = ["apps/code/src-tauri", "apps/chat/src-tauri", "crates/server"]
+resolver = "2"

@@ -23,9 +23,10 @@
   "scripts": {
     "dev": "turbo run dev --filter=@t3tools/code",
     "dev:web": "turbo run dev --filter=@t3tools/code",
-    "dev:desktop": "turbo run dev:tauri --filter=@t3tools/code",
+    "dev:chat": "turbo run dev --filter=@t3tools/chat",
+    "dev:desktop": "turbo run dev:tauri --filter=@t3tools/code --filter=@t3tools/chat",
     "build": "turbo run build",
-    "build:desktop": "turbo run build:tauri --filter=@t3tools/code",
+    "build:desktop": "turbo run build:tauri --filter=@t3tools/code --filter=@t3tools/chat",
     "typecheck": "turbo run typecheck",
     "lint": "oxlint --report-unused-disable-directives .",
     "test": "turbo run test",
@@ -49,7 +50,8 @@
   "packageManager": "bun@1.3.9",
   "msw": {
     "workerDirectory": [
-      "apps/code/public"
+      "apps/code/public",
+      "apps/chat/public"
     ]
   }
 }

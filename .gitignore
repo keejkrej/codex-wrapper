@@ -17,6 +17,11 @@ release/
 apps/code/.playwright
 apps/code/playwright-report
 apps/code/src/components/__screenshots__
+apps/chat/.playwright
+apps/chat/playwright-report
+apps/chat/src/components/__screenshots__
 .vitest-*
 __screenshots__/
 apps/code/src-tauri/target
+apps/chat/src-tauri/target
+target/
